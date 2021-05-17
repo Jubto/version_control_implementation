@@ -1,0 +1,67 @@
+#!/bin/dash
+
+if test ! -d '.gitr'
+then
+    echo "gitr-show: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test $# -eq 1
+then
+    arg="$1"
+    if echo $arg | grep ':' 1>/dev/null
+    then
+        commit=$(echo "$arg" | sed -re 's/^([^:]*):.*/\1/')
+        filename=$(echo "$arg" | sed -re 's/^[^:]*:(.*)/\1/')
+        if echo "$filename" | grep -E '[^a-zA-Z0-9][^a-zA-Z0-9\._-]+' 1>/dev/null
+        then
+            echo "gitr-show: error: invalid filename '"$filename"'" 2>&1
+            exit 1
+        elif test -z "$filename"
+        then
+            echo "gitr-show: error: invalid filename '"$filename"'" 2>&1
+            exit 1
+        elif test -z "$commit"
+        then
+            if grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+            then
+                if grep -E "^![^=]+==${filename}$" '.gitr/index' 1>/dev/null
+                then
+                    echo "gitr-show: error: '"$filename"' not found in index" 2>&1
+                    exit 1
+                else
+                    staged_blob="$(grep -E "[^=]+==${filename}$" '.gitr/index')"
+                    cat ".gitr/objects/blobs/${staged_blob}"
+                fi
+            elif grep -E "^[^=!]+==${filename}$" '.gitr/previous_index' 1>/dev/null
+            then
+                indexed_blob="$(grep -E "[^=]+==${filename}$" '.gitr/previous_index')"
+                cat ".gitr/objects/blobs/${indexed_blob}"
+            else
+                echo "gitr-show: error: '"$filename"' not found in index" 2>&1
+                exit 1
+            fi
+        elif echo "$commit" | grep -E '-' 1>/dev/null 
+        then
+            echo "usage: gitr-show <commit>:<filename>" 1>&2 # Didn't appear the 2041 gitr treated letters/special characters in commit differently excpet '-'
+            exit 1
+        elif test -f ".gitr/objects/commits/${commit}" 
+        then
+            if grep -E "==${filename}$" ".gitr/objects/commits/${commit}" 1>/dev/null
+            then
+                stored_blob="$(grep -E "[^=]+==${filename}$" ".gitr/objects/commits/${commit}")"
+                cat ".gitr/objects/blobs/${stored_blob}"
+            else
+                echo "gitr-show: error: '"$filename"' not found in commit ${commit}" 1>&2
+                exit 1
+            fi
+        else
+            echo "gitr-show: error: unknown commit '"$commit"'" 1>&2
+            exit 1
+        fi
+    else
+        echo "gitr-show: error: invalid object ${arg}" 1>&2
+        exit 1
+    fi
+else
+    echo "usage: gitr-show <commit>:<filename>" 1>&2
+    exit 1
+fi

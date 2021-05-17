@@ -1,0 +1,116 @@
+#!/bin/dash
+
+if test ! -d '.gitr'
+then
+    echo "gitr-add: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test $# -eq 0
+then
+    echo "usage: gitr-add <filenames>" 1>&2 # If any arguments are provided, exit 1
+    exit 1
+fi
+
+# function to handle case where file is added to index when it's already in index
+replace_old_blob()
+{
+filename=$1
+blob=$2
+if grep -E "$blob" '.gitr/index' 1>/dev/null
+then
+    : # file is identical, skip
+else # This means changes have been made to file which was already staged for commit 
+    old_blob="$(grep -E "[^=]+==${filename}$" '.gitr/index')"
+    rm ".gitr/objects/blobs/${old_blob}" # Remove old blob from objects 
+    sed --in-place -re "s/[^=]+==${filename}$//" '.gitr/index' # remove old blob from index
+    echo "$blob" >> '.gitr/index' # add updated blob to index
+    cp "$filename" ".gitr/objects/blobs/${blob}" # add updated blob to objects
+fi
+}
+
+# function to handle removing blob from index and objects
+remove_staged_blob()
+{
+
+filename=$1
+staged_blob="$(grep -E "[^=]+==${filename}$" '.gitr/index' | sed -re 's/^!//')"
+if ls ".gitr/objects/blobs/${staged_blob}" 1>/dev/null 2>&1
+then 
+    rm ".gitr/objects/blobs/${staged_blob}" # Remove old staged_blob content 
+fi
+sed --in-place -re "s/[^=]+==${filename}$//" '.gitr/index' # remove from index
+
+}
+
+if test "$(ls .gitr/objects/commits | wc -l)" -eq 0
+then
+    branch_commit='' # If no commits have been made, just make this empty, program will skip anything involving it
+else 
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on (e.g. .gitr/branches/master)
+    branch_commitID="$(cat ${branch})"
+    branch_commit=".gitr/objects/commits/${branch_commitID}"
+fi
+
+
+for filename in "$@"
+do
+    if test -e "$filename"
+    then
+        if test -f "$filename"
+        then
+            if echo "$filename" | grep -E '[^a-zA-Z0-9][^a-zA-Z0-9\._-]+' 1>/dev/null
+            then
+                echo "gitr-add: error: invalid filename '"$filename"'" 2>&1
+                exit 1
+            fi
+            blob="$(sha1sum "$filename" | tr ' ' '=')"
+            if grep -E "==${filename}$" "$branch_commit" 1>/dev/null 2>&1 # check if file in branch
+            then
+                if grep -E "$blob" "$branch_commit" 1>/dev/null 2>&1
+                then
+                    if cat '.gitr/index' | grep -E "^![^=]+==${filename}$" 1>/dev/null
+                    then
+                        remove_staged_blob "$filename" # If file is identical (same as repo) but untracked (via gitr-rm --cached)
+                    fi 
+                elif cat '.gitr/index' | grep -E "^![^=]+==${filename}$" 1>/dev/null # If file was not the same as repo, but untracked (via gitr-rm --cached)
+                then
+                    remove_staged_blob "$filename"
+                    echo "$blob" >> '.gitr/index'
+                    cp "$filename" ".gitr/objects/blobs/${blob}" # stage file for commit  
+                elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null # This means file was already in index, so possible new changes have been made
+                    then replace_old_blob "$filename" "$blob"
+                else
+                    echo "$blob" >> '.gitr/index' # file in commit but different content
+                    cp "$filename" ".gitr/objects/blobs/${blob}" # stage file for commit 
+                fi
+            elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+                then replace_old_blob "$filename" "$blob"
+            else
+                sha1sum "$filename" | tr ' ' '=' >> '.gitr/index' # filename is new to branch
+                cp "$filename" ".gitr/objects/blobs/${blob}" # stage file for commit 
+            fi
+        else
+            echo "gitr-add: error: $filename is not a regular file" 2>&1 # If argument can be opened but is not a file
+            exit 1
+        fi
+    elif grep -E "==${filename}$" "$branch_commit" 1>/dev/null 2>&1 # means file not in working tree but in commit
+    then
+        deleted_blob="$(grep -E "[^=]+==${filename}$" $branch_commit)" # get hash of deleted blob from repo
+        if cat '.gitr/index' | grep -E "^![^=]+==${filename}$" 1>/dev/null
+        then
+            echo "gitr-add: error: can not open '"$filename"'" 2>&1 # if file is 'deleted' gitr-add will not add it back
+            exit 1
+        elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+        then 
+            remove_staged_blob "$filename"
+            echo "!${deleted_blob}" >> '.gitr/index' # file-deleted, different changes to be committed case, mark file to be deleted
+        else 
+            echo "!${deleted_blob}" >> '.gitr/index' # file-deleted case, mark file to be deleted
+        fi
+    elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null # Means file not in working tree or commit, only index
+    then 
+        remove_staged_blob "$filename" # means added to index, file deleted via rm
+    else
+        echo "gitr-add: error: can not open '"$filename"'" 2>&1 # If argument cannot be opened, i.e. it's missing
+        exit 1
+    fi
+done

@@ -1,0 +1,150 @@
+#!/bin/dash
+
+if test ! -d '.gitr'
+then
+    echo "gitr-checkout: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test "$(ls .gitr/objects/commits | wc -l)" -eq 0
+then
+    echo "gitr-checkout: error: this command can not be run until after the first commit" 1>&2
+    exit 1
+elif test $# -eq 1
+then
+    current_branch="$(cat '.gitr/HEAD')"
+    checkout_branch="$1"
+    if test "${current_branch}" = ".gitr/branches/${checkout_branch}"
+    then
+        echo "Already on '"$checkout_branch"'"
+        exit 0
+    elif test ! -f ".gitr/branches/${checkout_branch}"
+    then
+        echo "gitr-checkout: error: unknown branch '"$checkout_branch"'" 1>&2
+        exit 1
+    elif test $(cat ".gitr/branches/${checkout_branch}") -eq $(cat "${current_branch}") # if checkout branch points to same commit as current, then just move pointer
+    then
+        echo ".gitr/branches/${checkout_branch}" > '.gitr/HEAD'
+        echo "Switched to branch '"$checkout_branch"'"
+        exit 0
+    fi
+
+    current_branch_head="$(cat "${current_branch}")"
+    current_branch_commit=".gitr/objects/commits/${current_branch_head}"
+
+    checkout_branch_head="$(cat ".gitr/branches/${checkout_branch}")"
+    checkout_branch_commit=".gitr/objects/commits/${checkout_branch_head}"
+
+    current_branch_only_blobs='' # This will contain blobs in current branch not present in checkout branch
+    checkout_branch_only_blobs='' # This will containn blobs in the checkout branch not present in current branch
+
+    # Find intersect, and left differences between the two branches
+    for current_branch_blob in $(sed '1d;2d' "${current_branch_commit}")
+    do
+        if grep -E "$current_branch_blob" "$checkout_branch_commit" 1>/dev/null
+        then : # Shared blobs can remain untouched
+        else
+            # echo current only blob: "$current_branch_blob"
+            current_branch_only_blobs="${current_branch_only_blobs}${current_branch_blob} "
+        fi
+    done
+
+    # Find the right difference between two branches
+    for checkout_branch_blob in $(sed '1d;2d' "${checkout_branch_commit}")
+    do
+        if grep -E "$checkout_branch_blob" "$current_branch_commit" 1>/dev/null
+        then : # shared
+        else
+            # echo checkout only blob: "$checkout_branch_blob"
+            checkout_branch_only_blobs="${checkout_branch_only_blobs}${checkout_branch_blob} "
+        fi
+    done
+
+    untracked_working_tree_files='' # This contains files which are untracked on the working tree, which share an identical name to blobs in checkout branch
+    current_branch_unsaved_files='' # This contain only blobs present in current branch but no checkout branch, which have unsaved (uncommitted) changes
+
+    # Find unsaved or untracked files in working tree
+    for filename in $(ls) # only files without spaces are provided or indexed
+    do
+        if grep -E "==${filename}$" "$current_branch_commit" 1>/dev/null # If blob is in current branch only (i.e. not present in checkout branch)
+        then
+            blob="$(sha1sum "$filename" | tr ' ' '=')"
+            if grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+            then
+                current_branch_unsaved_files="${current_branch_unsaved_files}${filename} " # blob has unsaved changes (which have been indexed)
+            elif grep -E "$blob" "$current_branch_commit" 1>/dev/null
+            then :
+            else
+                current_branch_unsaved_files="${current_branch_unsaved_files}${filename} " # blob has unsaved changes (which have not been indexed)
+            fi
+        else
+            # untracked files in working tree (NOTE: this does not include the pseudo untracked files, i.e. files with gitr-rm cached which haven't yet been committted)
+            untracked_working_tree_files="${untracked_working_tree_files}${filename} "
+        fi
+    done
+
+    # Capture unsaved files which have been deleted from working tree (by either rm or gitr-rm)
+    cat '.gitr/index' | while read staged_blob
+    do
+        filename="$(echo $staged_blob | sed -re 's/[^=]+==(.*)/\1/')"
+        if ls | grep -E --word-regexp "${filename}" 1>/dev/null # if staged file in working tree
+        then : # delt with above
+        elif grep -E "==${filename}$" "$current_branch_commit" 1>/dev/null # blob deleted from working tree, present only in current branch and not checkout branch
+        then
+            current_branch_unsaved_files="${current_branch_unsaved_files}${filename} " 
+        fi
+    done
+
+    untracked_file_matching_checkout='' # Store any untracked working tree file with an identical filename to a blob in checkout branch
+    if test ! -z "${checkout_branch_only_blobs}"
+    then
+        for checkout_blob in ${checkout_branch_only_blobs}
+        do
+            checkout_blob=$(echo $checkout_blob | tr -d '[:space:]')
+            filename="$(echo $checkout_blob | sed -re 's/[^=]+==(.*)/\1/')"
+            if echo "${untracked_working_tree_files}" | grep -E --word-regexp "${filename}" 1>/dev/null # If a checkout blob filename is identical to an untracked working tree filename
+            then
+                untracked_file_matching_checkout="${untracked_file_matching_checkout}${filename} "
+            fi
+        done
+    fi
+
+    checkout_error_files="${current_branch_unsaved_files}${untracked_file_matching_checkout}"
+    # Check whether there's any unsaved files or identical untracked files detected - if so error
+    if test ! -z "${checkout_error_files}"
+    then
+        # echo checkout_error_files is: ${checkout_error_files} 
+        echo "gitr-checkout: error: Your changes to the following files would be overwritten by checkout:" 1>&2
+        for file in ${checkout_error_files} ; do echo "${file}" ; done
+        exit 1
+    fi
+
+    # past this point means checkout is ready to commence
+    # Leave index un-touched, only delete files in current not in checkout, and add files in checkout not in current, leave common files in working tree
+
+    if test ! -z "${current_branch_only_blobs}"
+    then
+        for current_branch_blob in ${current_branch_only_blobs}
+        do
+            current_branch_blob=$(echo $current_branch_blob | tr -d '[:space:]')
+            filename="$(echo $current_branch_blob | sed -re 's/[^=]+==(.*)/\1/')"
+            rm "${filename}" # Remove file from working tree
+        done
+    fi
+
+    if test ! -z "${checkout_branch_only_blobs}"
+    then
+        for checkout_blob in ${checkout_branch_only_blobs}
+        do
+            checkout_blob=$(echo $checkout_blob | tr -d '[:space:]')
+            filename="$(echo ${checkout_blob} | sed -re 's/[^=]+==(.*)/\1/')"
+            cp ".gitr/objects/blobs/${checkout_blob}" "${filename}" # Copy blob content into a new file in working tree with that blobs filename
+        done
+    fi
+
+    echo ".gitr/branches/${checkout_branch}" > '.gitr/HEAD'
+    echo "Switched to branch '"$checkout_branch"'"
+    exit 0
+
+else
+    echo "usage: gitr-checkout <branch>" 1>&2
+    exit 1
+fi

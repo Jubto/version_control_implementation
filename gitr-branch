@@ -1,0 +1,136 @@
+#!/bin/dash
+
+if test "$(ls .gitr/objects/commits | wc -l)" -eq 0
+then
+    echo "gitr-branch: error: this command can not be run until after the first commit" 1>&2
+    exit 1
+else 
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on (e.g. .gitr/branches/master)
+    branch_commitID="$(cat ${branch})"
+    branch_commit=".gitr/objects/commits/${branch_commitID}"
+fi
+
+if test ! -d '.gitr'
+then
+    echo "gitr-branch: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test $# -eq 0
+then
+    ls '.gitr/branches' | while read branch ; do echo $branch ; done
+elif test $# -eq 1
+then
+    new_branch="$1"
+    if echo "$new_branch" | grep -E '-' 1>/dev/null
+    then
+        echo "usage: gitr-branch [-d] <branch>" 1>&2 
+        exit 1
+    elif echo "$new_branch" | grep -E -v '[a-zA-Z\._-]' 1>/dev/null # name containing only numbers is not allowed
+    then
+        echo "gitr-branch: error: invalid branch name '"$new_branch"'" 1>&2 
+        exit 1
+    elif test -f ".gitr/branches/${new_branch}"
+    then
+        echo "gitr-branch: error: branch '"$new_branch"' already exists" 1>&2
+        exit 1
+    fi
+
+    echo "${branch_commitID}" > ".gitr/branches/${new_branch}" # Make new branch file pointed to the same as current branch
+
+elif test $# -eq 2
+then
+    delete=''
+    delete_branch=''
+    for arg in "$@"
+    do
+        if test "${arg}" = '-d'
+        then
+            delete="${arg}"
+        elif echo "$arg" | grep -E '^-' 1>/dev/null
+        then
+            echo "usage: gitr-branch [-d] <branch>" 1>&2 
+            exit 1
+        else
+            delete_branch="${arg}"
+        fi
+    done
+
+    if test -z "${delete}"
+    then
+        echo "usage: gitr-branch [-d] <branch>" 1>&2 
+        exit 1
+    fi
+
+    if test ! -f ".gitr/branches/${delete_branch}"
+    then
+        echo "gitr-branch: error: branch '"$delete_branch"' doesn't exist" 1>&2
+        exit 1
+    elif test "${delete_branch}" = 'master'
+    then
+        echo "gitr-branch: error: can not delete branch 'master'" 1>&2
+        exit 1
+    fi
+
+    # deleteing a branch is just deleteing the branch pointer
+    # However, you can only delete the branch pointer if and only if doing so will not result in the commits that branch pointed to becoming un-reachable 
+    # if a delete would result in that, you must merge the two branches, such that your current branch now points to a commit which shares parents with both
+    # branches, hence meaning deleting the branch now is fine, since your current branch can reach anything the branch you're about to delete can 
+
+    log_history="$(mktemp /tmp/log_history.XXXXXXXXXX)" 
+    trap 'rm -f ${log_history} ; exit 1' INT TERM EXIT # Just good practice incase abrupt stop to program
+    
+    recurrsive_log() 
+    {
+        commit=$1
+        while true
+        do
+            echo "$(head -n2 "$commit" | sed '1d' | sed -re 's/meta: ([0-9]+)\s.*/\1/')" >> "${log_history}"
+            parents="$(head -n1 "$commit" | sed -re 's/[^:]+: (.*)/\1/' )"
+            if echo "${parents}" | grep -E ' ' 1>/dev/null
+            then # This means the given commit has two parents (due to merge)
+                for parent in ${parents}
+                do
+                    commit=".gitr/objects/commits/${parent}"
+                    recurrsive_log $commit
+                done
+            fi
+            commit=".gitr/objects/commits/${parents}"
+            if test $parents = 'none'
+            then
+                break
+            fi
+        done
+    }
+
+    # Finding all commits in current branch 
+    commit="${branch_commit}"
+    recurrsive_log $commit # Recursion is required because of some commits have two parents, of which can then have two parents, etc.
+    current_branch_commits="$(cat "${log_history}" | sort -n -r | uniq)" # sorting required since branches aren't always in order, uniq because my function can produce multiple 0's
+    echo '' > "${log_history}"
+
+
+    # Finding all commits in merging branch
+    delete_branchID="$(cat ".gitr/branches/${delete_branch}")" # find which commit branch to delete to pointing to
+    commit=".gitr/objects/commits/${delete_branchID}" # get what's in commit of branch to delete 
+    recurrsive_log $commit
+    delete_branch_commits="$(cat "${log_history}" | sort -n -r | uniq)"
+
+
+    for commit in ${delete_branch_commits}
+    do
+        if echo "${current_branch_commits}" | grep -E --word-regexp "${commit}" 1>/dev/null
+        then
+            : # branch to delete shares common commit with current branch
+        else
+            echo "gitr-branch: error: branch '"$delete_branch"' has unmerged changes" 1>&2 # Branch to delete has a commit which current branch doesn't
+            exit 1
+        fi
+    done
+
+    rm ".gitr/branches/${delete_branch}" # sucessfully delete branch pointer
+    echo "Deleted branch '"$delete_branch"'" 
+
+elif test $# -gt 2
+then
+    echo "usage: gitr-branch [-d] <branch>" 1>&2 # TODO make sure it's the same
+    exit 1
+fi

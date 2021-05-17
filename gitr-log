@@ -1,0 +1,49 @@
+#!/bin/dash
+ 
+recurrsive_log() 
+{
+    commit=$1
+    while true
+    do
+        echo "$(head -n2 "$commit" | sed '1d' | sed -re 's/meta: (.*)/\1/')" >> "${gitr_log}"
+        parents="$(head -n1 "$commit" | sed -re 's/[^:]+: (.*)/\1/' )"
+        if echo "${parents}" | grep -E ' ' 1>/dev/null
+        then # This means the given commit has two parents (due to merge)
+            for parent in ${parents}
+            do
+                commit=".gitr/objects/commits/${parent}"
+                recurrsive_log $commit
+            done
+        fi
+        commit=".gitr/objects/commits/${parents}"
+        if test $parents = 'none'
+        then
+            break
+        fi
+    done
+}
+
+if test ! -d '.gitr'
+then
+    echo "gitr-log: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test $# -ge 1
+then
+    echo "usage: gitr-log" 1>&2
+    exit 1
+elif test "$(ls .gitr/objects/commits | wc -l)" -gt 0
+then
+    gitr_log="$(mktemp /tmp/gitr_log.XXXXXXXXXX)" # Make temp to store log data
+    trap 'rm -f ${gitr_log}; exit 1' INT TERM EXIT # Just good practice incase abrupt stop to program
+
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on
+    branch_commitID="$(cat ${branch})"
+    commit=".gitr/objects/commits/${branch_commitID}"
+
+    recurrsive_log $commit # Recursively go through repo
+    sort --numeric-sort --reverse "${gitr_log}" | uniq # nicely stdout the log
+
+else
+    : # no commits made
+fi
+

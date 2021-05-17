@@ -1,0 +1,202 @@
+#!/bin/dash
+
+force=''
+cached=''
+files=''
+
+if test "$(ls .gitr/objects/commits | wc -l)" -eq 0
+then
+    branch_commit='' # If no commits have been made, just make this empty, program will skip anything involving it
+else 
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on (e.g. .gitr/branches/master)
+    branch_commitID="$(cat ${branch})"
+    branch_commit=".gitr/objects/commits/${branch_commitID}"
+fi
+
+if test ! -d '.gitr'
+then
+    echo "gitr-rm: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test $# -eq 0
+then
+    echo "usage: gitr-rm [--force] [--cached] <filenames>" 1>&2 
+    exit 1
+fi
+
+for arg in "$@"
+do
+    if test "${arg}" = '--force'
+    then
+        force="${arg}"
+    elif test "${arg}" = '--cached'
+    then
+        cached="${arg}"
+    elif echo "$arg" | grep -E '-' 1>/dev/null
+    then
+        echo "usage: gitr-rm [--force] [--cached] <filenames>" 1>&2 
+        exit 1
+    elif echo "$arg" | grep -E '[^a-zA-Z0-9][^a-zA-Z0-9\._-]+' 1>/dev/null
+    then
+        echo "gitr-rm: error: invalid filename '"$arg"'" 2>&1
+        exit 1
+    else
+        files="${files}${arg} "
+    fi
+done
+
+if test -z "${files}"
+then
+    echo "usage: gitr-rm [--force] [--cached] <filenames>" 1>&2 
+    exit 1
+fi
+
+# function to handle removing blob from index and objects
+remove_staged_blob()
+{
+
+filename=$1
+staged_blob="$(grep -E "[^=]+==${filename}$" '.gitr/index' | sed -re 's/^!//')"
+if ls ".gitr/objects/blobs/${staged_blob}" 1>/dev/null 2>&1
+then 
+    rm ".gitr/objects/blobs/${staged_blob}" # Remove old staged_blob content 
+fi
+sed --in-place -re "s/[^=]+==${filename}$//" '.gitr/index' # remove from index
+
+}
+
+to_remove=''
+indexed_for_removal=''
+gitr_rm_or_cached()
+{
+
+cached=$1
+committed_blob=$2
+filename=$3
+
+if test ! -z "${cached}"
+then
+    indexed_for_removal="${indexed_for_removal}!${committed_blob} "
+else
+    indexed_for_removal="${indexed_for_removal}!${committed_blob} "
+    to_remove="${to_remove}${filename} "
+fi
+
+}
+
+for filename in ${files}
+do
+    # If file is committed 
+    if grep -E "==${filename}$" "$branch_commit" 1>/dev/null 2>&1 # If file is in current branch
+    then
+        committed_blob="$(grep -E "[^=]+==${filename}$" "${branch_commit}")"
+        # IF file is in working directory 
+        if ls | grep -E --word-regexp "${filename}" 1>/dev/null # If file in working tree
+        then
+            blob="$(sha1sum "$filename" | tr ' ' '=')"
+            if grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+            then
+                if cat '.gitr/index' | grep -E "^![^=]+==${filename}$" 1>/dev/null # this is a case where file is 'untracked' and user runs gitr-rm/--cached again
+                then
+                    echo "gitr-rm: error: '"$filename"' is not in the gitr repository" 2>&1
+                    exit 1
+                elif grep -E "$blob" '.gitr/index' 1>/dev/null # file changed, changed staged for commit
+                then
+                    if test ! -z "${force}"
+                    then 
+                        remove_staged_blob "$filename"
+                        gitr_rm_or_cached "${cached}" "${committed_blob}" "${filename}"
+                    elif test ! -z "${cached}"
+                    then
+                        remove_staged_blob "$filename"
+                        indexed_for_removal="${indexed_for_removal}!${committed_blob} "
+                    else
+                        echo "gitr-rm: error: '"$filename"' has staged changes in the index" 2>&1
+                        exit 1
+                    fi
+                else # file changed, different changes staged for commit
+                    if test ! -z "${force}"
+                    then 
+                        remove_staged_blob "$filename"
+                        gitr_rm_or_cached "${cached}" "${committed_blob}" "${filename}"
+                    else
+                        echo "gitr-rm: error: '"$filename"' in index is different to both to the working file and the repository" 2>&1
+                        exit 1
+                    fi
+                fi
+            elif grep -E "$blob" "$branch_commit" 1>/dev/null 2>&1 # Same as repo
+            then 
+                gitr_rm_or_cached "${cached}" "${committed_blob}" "${filename}"
+            else #  not staged for commit
+                if test ! -z "${force}"
+                then 
+                    gitr_rm_or_cached "${cached}" "${committed_blob}" "${filename}"
+                elif test ! -z "${cached}"
+                then
+                    indexed_for_removal="${indexed_for_removal}!${committed_blob} "
+                else
+                    echo "gitr-rm: error: '"$filename"' in the repository is different to the working file" 2>&1
+                    exit 1
+                fi
+            fi
+
+        # File it not in working tree but is in committed (file deleted)
+        elif cat '.gitr/index' | grep -E "^![^=]+==${filename}$" 1>/dev/null # File is not in working tree, but in index marked with deletion
+        then
+            echo "gitr-rm: error: '"$filename"' is not in the gitr repository" 2>&1
+            exit 1
+        elif cat '.gitr/index' | grep -E "[^=]+==${filename}$" 1>/dev/null # file deleted, different changes staged for commit
+        then
+            remove_staged_blob "$filename" # remove file from index (and staged_blob)
+            indexed_for_removal="${indexed_for_removal}!${committed_blob} " # file-deleted, different changes to be committed case, mark file to be deleted
+        else # file deleted
+            indexed_for_removal="${indexed_for_removal}!${committed_blob} " 
+        fi
+
+    # If file is NOT committed 
+    elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+    then
+        if ls | grep -E --word-regexp "${filename}" 1>/dev/null # If file in working tree
+        then
+            blob="$(sha1sum "$filename" | tr ' ' '=')"
+            if grep -E "$blob" '.gitr/index' 1>/dev/null
+            then
+                if test ! -z "${force}" # If force was used
+                then
+                    if test ! -z "${cached}"
+                    then
+                        remove_staged_blob "$filename"
+                    else
+                        remove_staged_blob "$filename"
+                        to_remove="${to_remove}${filename} "
+                    fi
+                elif test ! -z "${cached}"
+                then
+                    remove_staged_blob "$filename"
+                else
+                    echo "gitr-rm: error: '"$filename"' has staged changes in the index" 2>&1
+                    exit 1
+                fi
+            elif test ! -z "${force}" # If force was used
+            then
+                if test ! -z "${cached}"
+                then
+                    remove_staged_blob "$filename"
+                else
+                    remove_staged_blob "$filename"
+                    to_remove="${to_remove}${filename} "
+                fi
+            else
+                echo "gitr-rm: error: '"$filename"' in index is different to both to the working file and the repository" 2>&1
+                exit 1
+            fi
+        else # added to index, file deleted
+            remove_staged_blob "$filename"
+        fi
+    else # untracked, or doesn't exist and not in index
+        echo "gitr-rm: error: '"$filename"' is not in the gitr repository" 2>&1
+        exit 1
+    fi
+done
+
+for blob in ${indexed_for_removal} ; do echo "!${blob}" >> '.gitr/index' ; done # Index all the files marked for deletion or untracking
+if test ! -z ${to_remove} ; then rm ${to_remove} ; fi

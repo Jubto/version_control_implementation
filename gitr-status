@@ -1,0 +1,92 @@
+#!/bin/dash
+
+if test ! -d '.gitr'
+then
+    echo "gitr-status: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+fi
+
+gitr_status="$(mktemp /tmp/gitr_status.XXXXXXXXXX)" # Make temp to store log data
+trap 'rm -f ${gitr_status}; exit 1' INT TERM EXIT # Just good practice incase abrupt stop to program
+
+if test "$(ls .gitr/objects/commits | wc -l)" -eq 0
+then
+    branch_commit='' # If no commits have been made, just make this empty, program will skip anything involving it
+else 
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on (e.g. .gitr/branches/master)
+    branch_commitID="$(cat ${branch})"
+    branch_commit=".gitr/objects/commits/${branch_commitID}"
+fi
+
+ls | while read filename # Read all files in current directory (this handles space cases)
+do
+    if echo "${filename}" | grep -E '[^a-zA-Z0-9][^a-zA-Z0-9\._-]+' 1>/dev/null
+    then continue # Don't acknowledge invalid filenames 
+    fi
+    blob="$(sha1sum "$filename" | tr ' ' '=')"
+    if grep -E "==${filename}$" "$branch_commit" 1>/dev/null 2>&1 # If file is in current branch
+    then
+        if grep -E "==${filename}$" '.gitr/index' 1>/dev/null # if file is also in index
+        then
+            if grep -E "^![^=]+==${filename}$" '.gitr/index' 1>/dev/null
+            then
+                echo "${filename} - untracked" >> "$gitr_status" # This is if gitr-rm --cached has been used, the index has yet to be committed (i.e. pseudo untracked)
+            elif grep -E "$blob" '.gitr/index' 1>/dev/null # if file is also identical to index
+            then
+                echo "${filename} - file changed, changes staged for commit" >> "$gitr_status"
+            else
+                echo "${filename} - file changed, different changes staged for commit" >> "$gitr_status"
+            fi
+        else
+            if grep -E "$blob" "$branch_commit" 1>/dev/null 2>&1 # if file is identical to branch
+            then
+                echo "${filename} - same as repo" >> "$gitr_status"
+            else
+                echo "${filename} - file changed, changes not staged for commit" >> "$gitr_status"
+            fi
+        fi
+    elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null # If file is just in index
+    then
+        if grep -E "$blob" '.gitr/index' 1>/dev/null # If file is identical to index
+        then
+            echo "${filename} - added to index" >> "$gitr_status"
+        else
+            echo "${filename} - added to index, file changed" >> "$gitr_status"
+        fi
+    else
+        echo "${filename} - untracked" >> "$gitr_status" # File is not in branch or index
+    fi
+done
+
+sed '1d;2d' "$branch_commit" 2>/dev/null | while read committed_blob
+do
+    # echo committed_blob: ${committed_blob}
+    filename="$(echo $committed_blob | sed -re 's/[^=]+==(.*)/\1/')"
+    if ls | grep -E --word-regexp "${filename}" 1>/dev/null # If commited file in working tree
+    then : # These cases were all delt with above
+    elif grep -E "!$committed_blob" '.gitr/index' 1>/dev/null # This means file missing from working tree compared to branch, and marked (!) for deletion (using gitr rm)
+    then
+        echo "${filename} - deleted" >> "$gitr_status" 
+    elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null # This means file missing from working tree, present in index, but not marked with ! (meaning rm used)
+    then
+        echo "${filename} - file deleted, different changes staged for commit" >> "$gitr_status"
+    else
+        echo "${filename} - file deleted" >> "$gitr_status"
+    fi
+done
+
+sed --in-place -re '/^\s*$/d' '.gitr/index' # remove any empty lines
+cat '.gitr/index' | while read staged_blob 
+do
+    # echo index blob: ${staged_blob}
+    filename="$(echo $staged_blob | sed -re 's/[^=]+==(.*)/\1/')"
+    if ls | grep -E --word-regexp "${filename}" 1>/dev/null # if staged file in working tree
+    then : # delt with above
+    elif grep -E "==${filename}$" "$branch_commit" 1>/dev/null 2>&1 # if staged file is committed
+    then : # delt with above
+    else # File not in working tree, branch, only in index (staged blob)
+        echo "${filename} - added to index, file deleted" >> "$gitr_status"
+    fi
+done
+
+sort "$gitr_status"

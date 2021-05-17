@@ -1,0 +1,137 @@
+#!/bin/dash
+
+if test "$(ls .gitr/objects/commits | wc -l)" -eq 0
+then
+    branch_commit='' # If no commits have been made, just make this empty, program will skip anything involving it
+else 
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on (e.g. .gitr/branches/master)
+    branch_commitID="$(cat ${branch})"
+    branch_commit=".gitr/objects/commits/${branch_commitID}"
+fi
+
+if test ! -d '.gitr'
+then
+    echo "gitr-commit: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test $# -lt 2
+then
+    echo "usage: gitr-commit [-a] -m commit-message" 1>&2
+    exit 1
+elif test $# -eq 2
+then
+    if test "$1" = '-m'
+    then
+        commit_message="$2"
+        if echo "$commit_message" | grep -E '^-' 1>/dev/null
+        then
+            echo "usage: gitr-commit [-a] -m commit-message" 1>&2
+            exit 1
+        fi
+
+    else
+        echo "usage: gitr-commit [-a] -m commit-message" 1>&2
+        exit 1
+    fi
+elif test $# -eq 3
+then
+    if test "$1" = '-a' && test "$2" = '-m' 
+    then
+        commit_message="$3"
+        if echo "$commit_message" | grep -E '^-' 1>/dev/null
+        then
+            echo "usage: gitr-commit [-a] -m commit-message" 1>&2
+            exit 1
+        fi
+
+        # only care about: committed files with unsaved changes or, non-committed files with indexed changes which are unsaved 
+        ls | while read filename
+        do
+            unsaved_files=''
+            blob="$(sha1sum "$filename" | tr ' ' '=')"
+            if grep -E "==${filename}$" "$branch_commit" 1>/dev/null 2>&1
+            then
+                if grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+                then
+                    if grep -E "$blob" '.gitr/index' 1>/dev/null
+                    then :
+                    else unsaved_files="${filename}" # file changed, different changes staged for commit case
+                    fi
+                elif grep -E "$blob" "$branch_commit" 1>/dev/null 2>&1
+                then :
+                else unsaved_files="${filename}" # file changed, changes not staged for commit case
+                fi
+            elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+            then
+                if grep -E "$blob" '.gitr/index' 1>/dev/null
+                then :
+                else unsaved_files="${filename}" # added to index, file changed case
+                fi
+            fi
+            if test ! -z "${unsaved_files}"
+            then
+                gitr-add "${unsaved_files}" # Index unsaved files
+            fi
+        done
+
+    else
+        echo "usage: gitr-commit [-a] -m commit-message" 1>&2
+        exit 1
+    fi
+else
+    echo "usage: gitr-commit [-a] -m commit-message" 1>&2 # More than 4 arguments
+fi
+
+if test -z "$(cat '.gitr/index')"
+then
+    echo "nothing to commit" 1>&2
+    exit 1
+else
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on (e.g. .gitr/branches/master)    
+    previous_commitID="$(cat '.gitr/commit_ID_tracker')" # Get previous commit
+    new_commitID="$(($previous_commitID + 1))" # Since commits are sequential, just add 1 from previous commit (starts off as -1)
+    new_commit=".gitr/objects/commits/${new_commitID}"
+
+    # Create new commit object
+    if test $previous_commitID -eq -1 # If no commits have ever been made, parent is None
+    then
+        echo "parent: none" > "$new_commit"
+    else
+        echo "parent: $branch_commitID" > "$new_commit"
+    fi
+    echo "meta: ${new_commitID} ${commit_message}" >> "$new_commit"
+
+    # Copy over parent commit connect
+    sed '1d;2d' "$branch_commit" 2>/dev/null | while read blob
+    do
+        echo "$blob" >> "$new_commit"
+    done
+
+    sed --in-place -re '/^\s*$/d' '.gitr/index' # remove any empty lines (due to replacing index blobs etc.)
+
+    # overwrite or delete anything within index file against the new commit object
+    cat '.gitr/index' | while read staged_blob 
+    do
+        filename="$(echo $staged_blob | sed -re 's/[^=]+==(.*)/\1/')"
+        blob_hash="$(echo $staged_blob | sed -re 's/^([^=]+)==.*/\1/')"
+        # echo filename is: ${filename} with hash ${blob_hash}
+        if echo "$staged_blob" | grep -E '^!' 1>/dev/null # This scenario can only happen after at least 1 commit
+        then
+            # echo "special commit remove case!!!"
+            sed --in-place -re "s/[^=]+==${filename}$//" "$new_commit" # new commit no longer points to deleted file
+        elif grep -E "==${filename}$" "$new_commit" 1>/dev/null
+        then
+            # echo "Replacing commit file blob with new one"
+            sed --in-place -re "s/^[^=]+(==${filename}$)/${blob_hash}\1/" "$new_commit" # update any files which changed with their new blob hashes
+        else
+            # echo "commit adding new blob"
+            echo "$staged_blob" >> "$new_commit" # new files to be committed
+        fi
+    done
+    cat '.gitr/index' > '.gitr/previous_index' # Require a store of the index for gitr-show :x to work as intended 
+    echo '' > '.gitr/index' # empty index 
+    sed --in-place -re '/^\s*$/d' "$new_commit" # Remove empty lines (due to deleted blobs)
+
+    echo $new_commitID > "${branch}" # Update branch head to point to most recent commit
+    echo $new_commitID > '.gitr/commit_ID_tracker' # update global commit tracker
+    echo "Committed as commit ${new_commitID}"
+fi

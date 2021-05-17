@@ -1,0 +1,326 @@
+#!/bin/dash
+
+if test "$(ls .gitr/objects/commits | wc -l)" -eq 0
+then
+    echo "gitr-merge: error: this command can not be run until after the first commit" 1>&2
+    exit 1
+else 
+    branch="$(cat '.gitr/HEAD')" # Find which branch gitr is on (e.g. .gitr/branches/master)
+    branch_commitID="$(cat ${branch})"
+fi
+
+if test ! -d '.gitr'
+then
+    echo "gitr-merge: error: gitr repository directory .gitr not found" 1>&2
+    exit 1
+elif test $# -lt 3 
+then
+    if echo $@ | grep -E '\-m' 1>/dev/null
+    then
+        echo "usage: gitr-merge <branch|commit> -m message" 1>&2
+        exit 1
+    elif echo $@ | grep -E '^-' 1>/dev/null
+    then
+        echo "usage: gitr-merge <branch|commit> -m message" 1>&2
+        exit 1
+    else
+        echo "gitr-merge: error: empty commit message"  1>&2
+        exit 1
+    fi
+elif test $# -eq 3
+then
+    merge_with=''
+    message=''
+    for arg in "$@"
+    do
+        if test "${arg}" = '-m'
+        then
+            message_next_arg="${arg}"
+        elif test ! -z "${message_next_arg}"
+        then
+            message="${arg}"
+            message_next_arg=''
+        elif echo "$arg" | grep -E '^-' 1>/dev/null
+        then
+            echo "usage: gitr-merge <branch|commit> -m message" 1>&2 
+            exit 1
+        else
+            merge_with="${arg}"
+        fi
+    done
+
+    if test -z "${message}"
+    then
+        echo "gitr-merge: error: empty commit message" 1>&2
+        exit 1
+    elif test -z "${merge_with}"
+    then
+        echo "usage: gitr-merge <branch|commit> -m message" 1>&2 
+        exit 1
+    fi
+
+    if echo "${merge_with}" | grep -E '[a-zA-Z\._-]' 1>/dev/null
+    then
+        if ls '.gitr/branches' | grep -E "${merge_with}" 1>/dev/null
+        then
+            merge_with="$(cat ".gitr/branches/${merge_with}")" # Get commit number of branch to merge with
+        else
+            echo "gitr-merge: error: unknown branch '"$merge_with"'" 1>&2 
+            exit 1
+        fi
+    elif ls '.gitr/objects/commits' | grep -E --word-regexp "${merge_with}" 1>/dev/null
+        then : 
+    else
+        echo "gitr-merge: error: unknown commit '"$merge_with"'" 1>&2 
+        exit 1
+    fi
+
+    log_history="$(mktemp /tmp/log_history.XXXXXXXXXX)" 
+    trap 'rm -f ${log_history} ; exit 1' INT TERM EXIT # Just good practice incase abrupt stop to program
+    
+    recurrsive_log() 
+    {
+        commit=$1
+        while true
+        do
+            echo "$(head -n2 "$commit" | sed '1d' | sed -re 's/meta: ([0-9]+)\s.*/\1/')" >> "${log_history}"
+            parents="$(head -n1 "$commit" | sed -re 's/[^:]+: (.*)/\1/' )"
+            if echo "${parents}" | grep -E ' ' 1>/dev/null
+            then # This means the given commit has two parents (due to merge)
+                for parent in ${parents}
+                do
+                    commit=".gitr/objects/commits/${parent}"
+                    recurrsive_log $commit
+                done
+            fi
+            commit=".gitr/objects/commits/${parents}"
+            if test $parents = 'none'
+            then
+                break
+            fi
+        done
+    }
+
+    # Finding all commits in current branch 
+    branch_commit=".gitr/objects/commits/${branch_commitID}"
+    commit="${branch_commit}"
+    recurrsive_log $commit # Recursion is required because of some commits have two parents, of which can then have two parents, etc.
+    current_branch_commits="$(cat "${log_history}" | sort -n -r | uniq)" # sorting required since branches aren't always in order, uniq because my function can produce multiple 0's
+    echo '' > "${log_history}"
+
+    # Finding all commits in merging branch
+    merge_commit=".gitr/objects/commits/${merge_with}"
+    commit="${merge_commit}"  
+    recurrsive_log $commit
+    merge_branch_commits="$(cat "${log_history}" | sort -n -r | uniq)"
+
+    untracked_working_tree_files='' # This contains files which are untracked on the working tree, which share an identical name to blobs in merge branch
+    # Find unsaved or untracked files in working tree - gitr will not allow merging if it finds these
+    for filename in $(ls)
+    do
+        if grep -E "==${filename}$" "$branch_commit" 1>/dev/null # If blob is in current branch only
+        then
+            blob="$(sha1sum "$filename" | tr ' ' '=')"
+            if grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+            then
+                echo "gitr-merge: error: can not merge: local changes to files" 1>&2 # file is in index, hence unsaved
+                exit 1
+            fi
+        elif grep -E "==${filename}$" '.gitr/index' 1>/dev/null
+            then
+                echo "gitr-merge: error: can not merge: local changes to files" 1>&2 # file is in index, not in repo, hence unsaved
+                exit 1
+        else
+            untracked_working_tree_files="${untracked_working_tree_files}${filename} " # Store untracked files for next block
+        fi
+    done
+
+    # Resolving merging branch having identical filename to untracked file
+    if test ! -z "${untracked_working_tree_files}"
+    then
+        merge_commits_list=$(sed '1d;2d' "${merge_commit}")
+        # sed '1d;2d' "${merge_commit}" | while read merge_branch_blob # Changed to forloop because while loop created sub-shell which exit 1 got caught in, not making it to global
+        for merge_branch_blob in $merge_commits_list
+        do
+            filename="$(echo $merge_branch_blob | sed -re 's/[^=]+==(.*)/\1/')"
+            if echo "${untracked_working_tree_files}" | grep -E "${filename}" 1>/dev/null # If a merge_branch_blob filename is identical to an untracked working tree filename
+            then
+                echo "gitr-merge: error: can not merge" 1>&2 # if untracked file has identical filename to blob in merging branch, then error
+                exit 1
+            fi
+        done
+    fi
+
+    # Simple merge cases:
+    for commit in ${merge_branch_commits}
+    do
+        if echo ${current_branch_commits} | grep -E --word-regexp "${commit}" 1>/dev/null
+        then : # This means merge commit is also within current branch commit tree
+        else next='true' ; break # This means merge commit not within branch tree
+        fi
+    done
+
+    if test -z $next
+    then
+        echo "Already up to date" # This means every commit of merging branch is present in current branch, nothing to merge
+        exit 0
+    fi
+    next=''
+
+    for commit in ${current_branch_commits}
+    do
+        if echo ${merge_branch_commits} | grep -E --word-regexp "${commit}" 1>/dev/null
+        then :
+        else next='true' ; break # This means the current tree is not within merge tree (i.e. disconnected)
+        fi
+    done
+
+    if test -z $next
+    then
+        echo "Fast-forward: no commit created" # This means every commit of merging branch is present in current branch + newer commits
+        echo "${merge_with}" > "${branch}" # Move pointer of current branch to merging branch
+        for blob in $(sed '1d;2d' ".gitr/objects/commits/${merge_with}")
+        do
+            filename="$(echo $blob | sed -re 's/[^=]+==(.*)/\1/')"
+            if ls | grep -E --word-regexp "${filename}" 1>/dev/null
+            then cp ".gitr/objects/blobs/${blob}" "${filename}" # Replace any files with same name
+            else
+                cp ".gitr/objects/blobs/${blob}" "${filename}" # Copy over any files present in fast-forward merged blob not present in current tree
+            fi
+        done
+        exit 0
+    fi
+
+    first_common_ancestor=''
+    for commit in ${merge_branch_commits}
+    do
+        if echo "${current_branch_commits}" | grep -E --word-regexp "${commit}" 1>/dev/null
+        then
+            first_common_ancestor="${commit}"
+            break
+        fi
+    done
+
+    # if the two branches have filenames present only in their branch, store those blobs in here
+    current_branch_only_filename_blobs='' 
+    merge_branch_only_filename_blobs='' 
+
+    # if the two branches share a common filename, store each branches blob in their respective variable
+    # NOTE: the reason I care about filenames rather than blobs (like with checkout) is because I'm looking for cases where the two branches share a common filename
+    # Which is also present in the common ancestor commit, and then making sure that at most only one of these two blobs differs from the commmon ancestor commit blob.
+    shared_filenames=''
+    current_branch_shared_filename_blobs='@ ' # need '@ ' in order to perform sed operation sed -re "s/.* ([^=]+==${filename}).*/\1/")" bellow 
+    merge_branch_shared_filename_blobs='@ '
+    identical_shared_filename_blobs='' # This is when both branches have the same file name, AND the files are identical
+    # Find intersect, and left differences between the two branches
+    for current_branch_blob in $(sed '1d;2d' "${branch_commit}")
+    do
+        filename="$(echo $current_branch_blob | sed -re 's/[^=]+==(.*)/\1/')"
+        if grep -E "==${filename}$" "$merge_commit" 1>/dev/null
+        then
+            if cat "$merge_commit" | grep -E --word-regexp "${current_branch_blob}" 1>/dev/null
+                then
+                    identical_shared_filename_blobs="${identical_shared_filename_blobs}${current_branch_blob} "
+                    continue
+            elif cat ".gitr/objects/commits/${first_common_ancestor}" | grep -E "==${filename}$" 1>/dev/null
+            then :
+            else
+                echo "gitr-merge: error: can not merge" 1>&2 # This is a case where, the two branches have a shared filename with different content, AND the common ancestor doesn't have the filename
+                exit 1
+            fi
+            shared_filenames="${shared_filenames}${filename} "
+            current_branch_shared_filename_blobs="${current_branch_shared_filename_blobs}${current_branch_blob} "      
+        else
+            # echo current only blob: "$current_branch_blob"
+            current_branch_only_filename_blobs="${current_branch_only_filename_blobs}${current_branch_blob} "
+        fi
+    done
+
+    # Find the right difference between two branches
+    for merge_branch_blob in $(sed '1d;2d' "${merge_commit}")
+    do
+        if echo "${identical_shared_filename_blobs}" | grep -E --word-regexp "${merge_branch_blob}" 1>/dev/null
+        then
+            continue
+        fi
+
+        filename="$(echo $merge_branch_blob | sed -re 's/[^=]+==(.*)/\1/')"
+        if grep -E "==${filename}$" "$branch_commit" 1>/dev/null
+        then
+            merge_branch_shared_filename_blobs="${merge_branch_shared_filename_blobs}${merge_branch_blob} "
+        else
+            # echo checkout only blob: "$merge_branch_blob"
+            merge_branch_only_filename_blobs="${merge_branch_only_filename_blobs}${merge_branch_blob} "
+        fi
+    done
+
+    missing_common_ancestor_files='' # These are files present in the common ancestor, but only present in ONE of the branches - will invoke error
+    most_recent_blobs='' # List of the most recent blob of the two branches - this will be used for the merged branch
+    # Go through all files of common ancestor
+    for common_ancestor_blob in $(sed '1d;2d' ".gitr/objects/commits/${first_common_ancestor}")
+    do
+        filename="$(echo $common_ancestor_blob | sed -re 's/[^=]+==(.*)/\1/')"
+        if echo "$shared_filenames" | grep -E --word-regexp "${filename}" 1>/dev/null
+        then
+            updated_blob=''
+            if echo "${current_branch_shared_filename_blobs}" | grep -E --word-regexp "${common_ancestor_blob}" 1>/dev/null # See whether common ancestor blob matches current branch blob
+            then :
+            else
+                updated_blob="$(echo ${current_branch_shared_filename_blobs} | sed -re "s/.* ([^=]+==${filename}).*/\1/")"
+            fi
+
+            if echo "${merge_branch_shared_filename_blobs}" | grep -E --word-regexp "${common_ancestor_blob}" 1>/dev/null # See whether ancestor blob matches merge blob
+            then :
+            elif test ! -z "${updated_blob}"
+            then
+                echo "gitr-merge: error: can not merge" 1>&2 # Both branches differ from their common ancestor file, gitr doesn't like that
+                exit 1
+            else
+                updated_blob="$(echo ${merge_branch_shared_filename_blobs} | sed -re "s/.* ([^=]+==${filename}).*/\1/")"
+            fi
+            most_recent_blobs="${most_recent_blobs}${updated_blob} "
+        elif echo "$current_branch_only_filename_blobs" | grep -E "==${filename} "  1>/dev/null
+        then
+            missing_common_ancestor_files="${missing_common_ancestor_files}${filename} " # File present in common ancestor, but not in merge branch
+        elif echo "$merge_branch_only_filename_blobs" | grep -E "==${filename} "  1>/dev/null
+        then
+            missing_common_ancestor_files="${missing_common_ancestor_files}${filename} " # File present in common ancestor, but not in current branch
+        fi
+    done
+
+    if test ! -z "${missing_common_ancestor_files}"
+    then
+        echo "gitr-merge: error: These files can not be merged:" 1>&2
+        for filename in ${missing_common_ancestor_files} ; do echo ${filename} ; done
+        exit 1
+    fi
+
+    # Merge has been a success after this point, so copy/replace files in working tree
+    for blob_to_add in ${merge_branch_only_filename_blobs} ${most_recent_blobs}
+    do
+        blob_to_add=$(echo $blob_to_add | tr -d '[:space:]')
+        filename="$(echo $blob_to_add | sed -re 's/[^=]+==(.*)/\1/')"
+        cp ".gitr/objects/blobs/${blob_to_add}" "${filename}" 
+    done
+
+    # side note: ideally would have liked to run gitr-add/gitr-commit but didn't designed them to handle merge input (too short on time now)
+    previous_commitID="$(cat '.gitr/commit_ID_tracker')" # Get previous commit
+    new_commitID="$(($previous_commitID + 1))" 
+    new_commit=".gitr/objects/commits/${new_commitID}"
+    echo "parent: $branch_commitID" "${merge_with}" > "$new_commit"
+    echo "meta: ${new_commitID} ${message}" >> "$new_commit"
+
+    for blob in ${current_branch_only_filename_blobs} ${merge_branch_only_filename_blobs} ${most_recent_blobs} ${identical_shared_filename_blobs}
+    do 
+        blob=$(echo $blob | tr -d '[:space:]')
+        echo "$blob" >> "$new_commit"
+    done
+
+    echo $new_commitID > "${branch}" # Update branch head to point to most recent commit
+    echo $new_commitID > '.gitr/commit_ID_tracker' # update global commit tracker
+    echo "Committed as commit ${new_commitID}"
+
+else
+    echo "usage: gitr-merge <branch|commit> -m message" 1>&2
+    exit 1
+fi
