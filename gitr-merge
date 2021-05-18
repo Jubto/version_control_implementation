@@ -303,7 +303,6 @@ then
         cp ".gitr/objects/blobs/${blob_to_add}" "${filename}" 
     done
 
-    # side note: ideally would have liked to run gitr-add/gitr-commit but didn't designed them to handle merge input (too short on time now)
     previous_commitID="$(cat '.gitr/commit_ID_tracker')" # Get previous commit
     new_commitID="$(($previous_commitID + 1))" 
     new_commit=".gitr/objects/commits/${new_commitID}"

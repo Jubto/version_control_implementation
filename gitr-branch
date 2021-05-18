@@ -70,11 +70,6 @@ then
         exit 1
     fi
 
-    # deleteing a branch is just deleteing the branch pointer
-    # However, you can only delete the branch pointer if and only if doing so will not result in the commits that branch pointed to becoming un-reachable 
-    # if a delete would result in that, you must merge the two branches, such that your current branch now points to a commit which shares parents with both
-    # branches, hence meaning deleting the branch now is fine, since your current branch can reach anything the branch you're about to delete can 
-
     log_history="$(mktemp /tmp/log_history.XXXXXXXXXX)" 
     trap 'rm -f ${log_history} ; exit 1' INT TERM EXIT # Just good practice incase abrupt stop to program
     
